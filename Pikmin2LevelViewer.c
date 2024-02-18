@@ -1,3 +1,8 @@
+/*
+* (C) 2024 badasahog. All Rights Reserved
+* The above copyright notice shall be included in
+* all copies or substantial portions of the Software.
+*/
 #include <Windows.h>
 #include <commctrl.h>
 
