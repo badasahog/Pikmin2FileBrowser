@@ -98,9 +98,480 @@ struct gameFileInTree* gameFileList;
 * 1: *.txt
 * 2: *.ini
 */
+
+struct decodedAsset
+{
+	uint32_t assetType;
+	void* assetPtr;
+};
+const uint32_t ASSET_TYPE_TEXT = 0;
+const uint32_t ASSET_TYPE_TEXTURE = 1;
+
+struct decodedAsset* decodedAssetTable;
+int decodedAssetCount = 0;
+void* decodedAssetData;
+
+struct decodedImage
+{
+	uint32_t width;
+	uint32_t height;
+	uint32_t pixelCount;
+	const void* pixels;
+};
+
 static int displayedFileType = 0;
 
 static int selectedFileIndex = 0;
+
+
+int Unpack565(const uint8_t* const _In_ packed, uint8_t* _Out_ color)
+{
+	// build the packed value - GCN: indices reversed
+	const int value = (int)packed[1] | ((int)packed[0] << 8);
+
+	// get the components in the stored range
+	const uint8_t red = (uint8_t)((value >> 11) & 0x1f);
+	const uint8_t green = (uint8_t)((value >> 5) & 0x3f);
+	const uint8_t blue = (uint8_t)(value & 0x1f);
+
+	// scale up to 8 bits
+	color[0] = (red << 3) | (red >> 2);
+	color[1] = (green << 2) | (green >> 4);
+	color[2] = (blue << 3) | (blue >> 2);
+	color[3] = 255;
+
+
+	return value;
+}
+
+void DecompressColorGCN(const uint32_t _In_ texWidth, uint8_t* _Out_writes_bytes_all_(texWidth * 32) rgba, const void* const _In_ block)
+{
+	// get the block bytes
+	const uint8_t* bytes = block;
+
+	// unpack the endpoints
+	uint8_t codes[16];
+	const int a = Unpack565(bytes, codes);
+	const int b = Unpack565(bytes + 2, codes + 4);
+
+	// generate the midpoints
+	for (int i = 0; i < 3; ++i)
+	{
+		const int c = codes[i];
+		const int d = codes[4 + i];
+
+		if (a <= b)
+		{
+			codes[8 + i] = (uint8_t)((c + d) / 2);
+			// GCN: Use midpoint RGB rather than black
+			codes[12 + i] = codes[8 + i];
+		}
+		else
+		{
+			// GCN: 3/8 blend rather than 1/3
+			codes[8 + i] = (uint8_t)((c * 5 + d * 3) >> 3);
+			codes[12 + i] = (uint8_t)((c * 3 + d * 5) >> 3);
+		}
+	}
+
+	// fill in alpha for the intermediate values
+	codes[8 + 3] = 255;
+	codes[12 + 3] = (a <= b) ? 0 : 255;
+
+	// unpack the indices
+	uint8_t indices[16];
+	for (int i = 0; i < 4; ++i)
+	{
+		uint8_t* ind = indices + 4 * i;
+		uint8_t packed = bytes[4 + i];
+
+		// GCN: indices reversed
+		ind[3] = packed & 0x3;
+		ind[2] = (packed >> 2) & 0x3;
+		ind[1] = (packed >> 4) & 0x3;
+		ind[0] = (packed >> 6) & 0x3;
+	}
+
+	// store out the colors
+	for (int y = 0; y < 4; y++)
+		for (int x = 0; x < 4; x++)
+		{
+			uint8_t offset = 4 * indices[y * 4 + x];
+			for (int j = 0; j < 4; j++)
+			{
+				rgba[4 * ((y * texWidth + x)) + (j)] = codes[offset + j];//+ (i - 8 < 0 ? 0 : 128)
+			}// - i % 4
+		}
+}
+
+void decodeTexture(uint32_t width, uint32_t height, uint32_t pixelCount, const uint8_t* _In_ pixelsIn, uint8_t* _Out_ pixelsOut, const uint8_t format)
+{
+	switch (format)
+	{
+	case 0xE://cmpr
+	{
+
+		uint32_t ByteInBlock = 0;
+
+		for (int y = 0; y < height; y += 8)
+		{
+			for (int x = 0; x < width; x += 8)
+			{
+				//decode full dxt1 block, (4 sub blocks)
+				DecompressColorGCN(width, OffsetPointer(pixelsOut, 4 * (y * width + x)), &pixelsIn[ByteInBlock]);
+				ByteInBlock += 8;
+				DecompressColorGCN(width, OffsetPointer(pixelsOut, 4 * ((y)*width + (x + 4))), &pixelsIn[ByteInBlock]);
+				ByteInBlock += 8;
+				DecompressColorGCN(width, OffsetPointer(pixelsOut, 4 * ((y + 4) * width + (x))), &pixelsIn[ByteInBlock]);
+				ByteInBlock += 8;
+				DecompressColorGCN(width, OffsetPointer(pixelsOut, 4 * ((y + 4) * width + (x + 4))), &pixelsIn[ByteInBlock]);
+				ByteInBlock += 8;
+			}
+		}
+		break;
+	}
+	case 0x5://RGB5A3
+	{
+		int inputPixelIndex = 0;
+		for (int y = 0; y < height; y += 4)
+		{
+			for (int x = 0; x < width; x += 4)
+			{
+				for (int j = 0; j < 4; j++)
+				{
+					for (int k = 0; k < 4; k++)
+					{
+						uint16_t pixel = SwapEndian(*OffsetPointer((uint16_t*)pixelsIn, inputPixelIndex * sizeof(uint16_t)));
+
+						uint32_t outputPixel = 0;
+						if (pixel & 0b1000000000000000)
+						{
+							//no alpha
+							uint8_t pixelB = ((pixel & 0b0000000000011111) >> 0) * 0x8;
+							uint8_t pixelG = ((pixel & 0b0000001111100000) >> 5) * 0x8;
+							uint8_t pixelR = ((pixel & 0b0111110000000000) >> 10) * 0x8;
+
+							*OffsetPointer((uint8_t*)&outputPixel, 0) = pixelR;
+							*OffsetPointer((uint8_t*)&outputPixel, 1) = pixelG;
+							*OffsetPointer((uint8_t*)&outputPixel, 2) = pixelB;
+							*OffsetPointer((uint8_t*)&outputPixel, 3) = 255;
+						}
+						else
+						{
+							//3 bit alpha
+							uint8_t pixelB = ((pixel & 0b0000000000001111) >> 0) * 0x11;
+							uint8_t pixelG = ((pixel & 0b0000000011110000) >> 4) * 0x11;
+							uint8_t pixelR = ((pixel & 0b0000111100000000) >> 8) * 0x11;
+							uint8_t pixelA = ((pixel & 0b0111000000000000) >> 12) * 0x20;
+
+							*OffsetPointer((uint8_t*)&outputPixel, 0) = pixelR;
+							*OffsetPointer((uint8_t*)&outputPixel, 1) = pixelG;
+							*OffsetPointer((uint8_t*)&outputPixel, 2) = pixelB;
+							*OffsetPointer((uint8_t*)&outputPixel, 3) = pixelA;
+						}
+						*((uint32_t*)OffsetPointer(pixelsOut, 4 * (((y + j) * width + x) + k))) = outputPixel;
+						inputPixelIndex++;
+					}
+				}
+			}
+		}
+		break;
+	}
+	case 0x3://IA8
+	{
+		int inputPixelIndex = 0;
+		for (int y = 0; y < height; y += 4)
+		{
+			for (int x = 0; x < width; x += 4)
+			{
+				for (int j = 0; j < 4; j++)
+				{
+					for (int k = 0; k < 4; k++)
+					{
+						uint16_t pixel = SwapEndian(*OffsetPointer((uint16_t*)pixelsIn, inputPixelIndex * sizeof(uint16_t)));
+
+						uint32_t outputPixel = 0;
+
+
+						*OffsetPointer((uint8_t*)&outputPixel, 0) = pixel & 0xFF;
+						*OffsetPointer((uint8_t*)&outputPixel, 1) = pixel & 0xFF;
+						*OffsetPointer((uint8_t*)&outputPixel, 2) = pixel & 0xFF;
+						*OffsetPointer((uint8_t*)&outputPixel, 3) = (pixel & 0xFF00) >> 8;
+
+						*((uint32_t*)OffsetPointer(pixelsOut, 4 * (((y + j) * width + x) + k))) = outputPixel;
+						inputPixelIndex++;
+					}
+				}
+			}
+		}
+		break;
+	}
+	case 0x0://I4 //todo: untested
+	{
+		int inputPixelIndex = 0;
+		for (int y = 0; y < height; y += 8)
+		{
+			for (int x = 0; x < width; x += 8)
+			{
+				for (int j = 0; j < 8; j++)
+				{
+					for (int k = 0; k < 8; k += 2)
+					{
+						uint8_t pixel = *OffsetPointer((uint8_t*)pixelsIn, inputPixelIndex * sizeof(uint8_t));
+
+						uint32_t outputPixel = 0;
+
+						*OffsetPointer((uint8_t*)&outputPixel, 0) = (pixel & 0b11110000) >> 4;
+						*OffsetPointer((uint8_t*)&outputPixel, 1) = (pixel & 0b11110000) >> 4;
+						*OffsetPointer((uint8_t*)&outputPixel, 2) = (pixel & 0b11110000) >> 4;
+						*OffsetPointer((uint8_t*)&outputPixel, 3) = 0xFF;
+
+						*((uint32_t*)OffsetPointer(pixelsOut, 4 * (((y + j) * width + x) + k))) = outputPixel;
+
+						*OffsetPointer((uint8_t*)&outputPixel, 0) = (pixel & 0b00001111);
+						*OffsetPointer((uint8_t*)&outputPixel, 1) = (pixel & 0b00001111);
+						*OffsetPointer((uint8_t*)&outputPixel, 2) = (pixel & 0b00001111);
+						*OffsetPointer((uint8_t*)&outputPixel, 3) = 0xFF;
+
+
+						*((uint32_t*)OffsetPointer(pixelsOut, 4 * (((y + j) * width + x) + k + 1))) = outputPixel;
+						inputPixelIndex++;
+					}
+				}
+			}
+		}
+		break;
+	}
+	case 0x2://IA4 //todo: untested
+	{
+		int inputPixelIndex = 0;
+		for (int y = 0; y < height; y += 4)
+		{
+			for (int x = 0; x < width; x += 8)
+			{
+				for (int j = 0; j < 4; j++)
+				{
+					for (int k = 0; k < 8; k++)
+					{
+						uint8_t pixel = *OffsetPointer((uint8_t*)pixelsIn, inputPixelIndex * sizeof(uint8_t));
+
+						uint32_t outputPixel = 0;
+
+						uint8_t grayScale = (pixel & 0b00001111) * 0x11;
+						uint8_t alpha = ((pixel & 0b11110000) >> 4) * 0x11;
+
+						*OffsetPointer((uint8_t*)&outputPixel, 0) = grayScale;
+						*OffsetPointer((uint8_t*)&outputPixel, 1) = grayScale;
+						*OffsetPointer((uint8_t*)&outputPixel, 2) = grayScale;
+						*OffsetPointer((uint8_t*)&outputPixel, 3) = alpha;
+
+						*((uint32_t*)OffsetPointer(pixelsOut, 4 * (((y + j) * width + x) + k))) = outputPixel;
+						inputPixelIndex++;
+					}
+				}
+			}
+		}
+		break;
+	}
+	case 0x4://RGB565
+	{
+		int inputPixelIndex = 0;
+		for (int y = 0; y < height; y += 4)
+		{
+			for (int x = 0; x < width; x += 4)
+			{
+				for (int j = 0; j < 4; j++)
+				{
+					for (int k = 0; k < 4; k++)
+					{
+						//Unpack565() swaps endian internally
+						uint16_t pixel = *OffsetPointer((uint16_t*)pixelsIn, inputPixelIndex * sizeof(uint16_t));
+
+						uint32_t outputPixel = 0;
+						Unpack565(&pixel, &outputPixel);
+
+
+						*((uint32_t*)OffsetPointer(pixelsOut, 4 * (((y + j) * width + x) + k))) = outputPixel;
+						inputPixelIndex++;
+					}
+				}
+			}
+		}
+		break;
+	}
+	default:
+
+		//DebugBreak();
+	}
+}
+
+int DecompressYAZ
+(
+	// returns:
+	//	    ERR_OK:           compression done
+	//	    ERR_WARNING:      silent==true: dest buffer too small
+	//	    ERR_INVALID_DATA: invalid source data
+
+	const void* data,		// source data
+	size_t		data_size,	// size of 'data'
+	void* dest_buf,	// destination buffer (decompressed data)
+	size_t		dest_buf_size,	// size of 'dest_buf'
+	size_t* write_status,	// number of written bytes
+	//ccp			fname,		// file name for error messages
+	int			yaz_version,	// yaz version for error messages (0|1)
+	bool		silent,		// true: don't print error messages
+	FILE* hexdump	// not NULL: write decrompression hex-dump
+)
+{
+	assert(data);
+	assert(dest_buf);
+	assert(dest_buf_size);
+	//TRACE("DecompressYAZ(vers=%d) src=%p+%zu, dest=%p+%zu\n", yaz_version, data, data_size, dest_buf, dest_buf_size);
+
+	const uint8_t* src = data;
+	const uint8_t* src_end = src + data_size;
+	uint8_t* dest = dest_buf;
+	uint8_t* dest_end = dest + dest_buf_size;
+	uint8_t  code = 0;
+	int code_len = 0;
+
+	unsigned int count0 = 0;
+	unsigned int count1 = 0;
+	unsigned int count2 = 0;
+	unsigned int count3 = 0;
+
+	int addr_fw = 0;
+	char buf[12];
+	if (hexdump)
+	{
+		fprintf(hexdump, "\n"
+			"# size of compressed data:    %#8zx = %9zu\n"
+			"# size of de-compressed data: %#8zx = %9zu\n"
+			"\n",
+			data_size, data_size, dest_buf_size, dest_buf_size);
+		addr_fw = snprintf(buf, sizeof(buf), "%zx", dest_buf_size - 1) + 1;
+	}
+
+	while (src < src_end && dest < dest_end)
+	{
+		if (!code_len--)
+		{
+			if (hexdump)
+			{
+				count0++;
+				fprintf(hexdump,
+					"%*x: %02x -- -- : type byte\n",
+					addr_fw, (unsigned int)(src - (uint8_t*)data), *src);
+			}
+
+			code = *src++;
+			code_len = 7;
+		}
+
+		if (code & 0x80)
+		{
+			if (hexdump)
+			{
+				count1++;
+				fprintf(hexdump,
+					"%*x: %02x -- -- : copy direct\n",
+					addr_fw, (unsigned int)(src - (uint8_t*)data), *src);
+			}
+
+			// copy 1 byte direct
+			*dest++ = *src++;
+		}
+		else
+		{
+			// rle part
+
+			const uint8_t b1 = *src++;
+			const uint8_t b2 = *src++;
+			const uint8_t* copy_src = dest - ((b1 & 0x0f) << 8 | b2) - 1;
+
+			int n = b1 >> 4;
+			if (!n)
+				n = *src++ + 0x12;
+			else
+				n += 2;
+			assert(n >= 3 && n <= 0x111);
+
+			//noPRINT_IF(copy_src + n > dest, "RLE OVERLAP: copy %zu..%zu -> %zu\n", copy_src - szs->data, copy_src + n - szs->data, dest - szs->data);
+
+			if (copy_src < (uint8_t*)dest_buf)
+			{
+				if (write_status)
+					*write_status = dest - (uint8_t*)dest_buf;
+				//if (!silent)
+				//	ERROR0(ERR_INVALID_DATA, "YAZ%u data corrupted: Back reference points before beginning of data: %s\n", yaz_version, fname ? fname : "?");
+				//return ERR_INVALID_DATA;
+			}
+
+			if (dest + n > dest_end)
+			{
+				// first copy as much as possible
+				while (dest < dest_end)
+					*dest++ = *copy_src++;
+
+				if (write_status)
+					*write_status = dest - (uint8_t*)dest_buf;
+				//return silent ? ERR_WARNING : ERROR0(ERR_INVALID_DATA, "YAZ%u data corrupted: Decompressed data larger than specified (%zu>%zu): %s\n", yaz_version, GetDecompressedSizeYAZ(data, data_size), dest_buf_size, fname ? fname : "?");
+				return -1;
+			}
+
+			if (hexdump)
+			{
+				if (n < 0x12)
+				{
+					count2++;
+					fprintf(hexdump, "%*x: %02x %02x --", addr_fw, (unsigned int)(src - 2 - (uint8_t*)data), src[-2], src[-1]);
+				}
+				else
+				{
+					count3++;
+					fprintf(hexdump, "%*x: %02x %02x %02x",
+						addr_fw, (unsigned int)(src - 3 - (uint8_t*)data),
+						src[-3], src[-2], src[-1]);
+				}
+				fprintf(hexdump, " : copy %03x off %04d:", n, (unsigned int)(copy_src - dest));
+				int max = n < 10 ? n : 10;
+				const uint8_t* hex_src = copy_src;
+
+				// copy data before hexdump
+				while (n-- > 0)
+					*dest++ = *copy_src++;
+
+				while (max-- > 0)
+					fprintf(hexdump, " %02x", *hex_src++);
+				if (hex_src != copy_src)
+					fputs(" ...\n", hexdump);
+				else
+					fputc('\n', hexdump);
+			}
+			else
+			{
+				// don't use memcpy() or memmove() here because
+				// they don't work with self referencing chunks.
+				while (n-- > 0)
+					*dest++ = *copy_src++;
+			}
+		}
+
+		code <<= 1;
+	}
+	assert(src <= src_end);
+	assert(dest <= dest_end);
+
+	if (hexdump)
+		fprintf(hexdump, "\n"
+			"# %u type bytes, %u single bytes, %u+%u back references\n"
+			"\n",
+			count0, count1, count2, count3);
+
+	if (write_status)
+		*write_status = dest - (uint8_t*)dest_buf;
+	return 0;
+}
 
 LRESULT CALLBACK FileViewerWindowProcedure(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
@@ -157,14 +628,44 @@ LRESULT CALLBACK FileViewerWindowProcedure(HWND hwnd, UINT msg, WPARAM wParam, L
 		break;
 		case WM_PAINT:
 		{
-			if (displayedFileType == 1 || displayedFileType == 2)
+
+			//decodedAssetCount = 1;
+			//decodedAssets[0].assetType = ASSET_TYPE_TEXT;
+			//decodedAssets[0].assetPtr = gameFileList[selectedFileIndex].filePtr;
+			PAINTSTRUCT ps = { 0 };
+			HDC hdc = BeginPaint(hwnd, &ps);
+			int nextAssetLocationY = 0;
+			for (int i = 0; i < decodedAssetCount; i++)
 			{
-				PAINTSTRUCT ps = { 0 };
-				HDC hdc = BeginPaint(hwnd, &ps);
-				RECT rect = { 25, si.nPos * -25, 500, 2000 };
-				DrawTextA(hdc, gameFileList[selectedFileIndex].filePtr, -1, &rect, DT_LEFT | DT_TOP);
-				EndPaint(hwnd, &ps);
+				switch (decodedAssetTable[i].assetType)
+				{
+				case ASSET_TYPE_TEXT:
+				{
+					RECT rect = { 25, si.nPos * -25, 500, 2000 };
+					DrawTextA(hdc, decodedAssetTable[i].assetPtr, -1, &rect, DT_LEFT | DT_TOP);
+					break;
+				}
+				case ASSET_TYPE_TEXTURE:
+				{
+					const struct decodedImage* imgHeader = decodedAssetTable[i].assetPtr;
+					BITMAPINFO info = { 0 };
+					info.bmiHeader.biBitCount = 32;
+					info.bmiHeader.biWidth = imgHeader->width;
+					info.bmiHeader.biHeight = imgHeader->height;
+					info.bmiHeader.biPlanes = 1;
+					info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+					info.bmiHeader.biSizeImage = imgHeader->pixelCount * 4;
+
+					// Draw the pixel
+					StretchDIBits(hdc, 0, nextAssetLocationY, imgHeader->width * 4, imgHeader->height * 4, 0, 0, imgHeader->width, imgHeader->height, imgHeader->pixels, &info, DIB_RGB_COLORS, SRCCOPY);
+					nextAssetLocationY += imgHeader->height * 4;
+					break;
+				}
+				}
 			}
+			
+
+			EndPaint(hwnd, &ps);
 			break;
 		}
 		case WM_DESTROY:
@@ -396,81 +897,287 @@ LRESULT CALLBACK WindowProcedure(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 						memset(dest, 0, SwapEndian(header->uncompressedSize));
 						uint8_t* dest_end = OffsetPointer(dest, SwapEndian(header->uncompressedSize));// pointer to end of destination (last byte +1)
 
-						uint8_t  group_head = 0; // group header byte ...
-						int group_head_len = 0; // ... and it's length to manage groups
+						int decompressionStatus = DecompressYAZ(
+							src,//data
+							gameFileList[selectedFileIndex].fileSize - sizeof(struct yaz0Header),//data size
+							dest,//dest buf
+							SwapEndian(header->uncompressedSize),
+							nullptr,//write status
+							0,//yaz version (pikmin 2 uses yaz0)
+							true,
+							nullptr
+							);
 
-						while (src < src_end && dest < dest_end)
+						printf("decompression status: %i\n", decompressionStatus);
+
+						//for (int j = 180; j < 512; j++)
+						//for (int j = 192; j < 512; j++)
+						//for (int j = 224; j < 512; j++)
+						//{
+						//	printf("%c", dest[j]);
+						//}
+
+						//printf("\n");
+
+						//todo: sort different files by type, but for now just assume its always bmd
+
 						{
-							if (!group_head_len)
+							struct J3DFileHeader {
+								uint32_t J3DVersion;
+								uint32_t fileVersion;
+								uint8_t unknown1[4];
+								uint32_t blockCount;
+								uint8_t unknown2[16];
+							};
+
+							//todo: temporary hardcoded offset
+							const struct J3DFileHeader* bmdFileHeader = OffsetPointer(dest, 192);
+
+							printf("block count: %i\n", SwapEndian(bmdFileHeader->blockCount));
+
+							const void* bmdFile = OffsetPointer(bmdFileHeader, sizeof(struct J3DFileHeader));
+							decodedAssetCount = 0;
+
+							void* decodedAssetFreeZone = decodedAssetData;
+
+
+							//iterate over bmd sections
+							struct bmdSection
 							{
-								//*** start a new data group and read the group header byte.
+								char chunkType[4];
+								int32_t size;
+							};
+							const struct bmdSection* currentSection = bmdFile;
 
-								group_head = *src++;
-								group_head_len = 8;
-							}
-
-							group_head_len--;
-							if (group_head & 0x80)
+							for (int i = 0; i < SwapEndian(bmdFileHeader->blockCount); i++)
 							{
-								//*** bit in group header byte is set -> copy 1 byte direct
+								printf("chunk type: %c%c%c%c\n",
+									currentSection->chunkType[0],
+									currentSection->chunkType[1],
+									currentSection->chunkType[2],
+									currentSection->chunkType[3]
+								);
 
-								*dest++ = *src++;
-							}
-							else
-							{
-								//*** bit in group header byte is not set -> run length encoding
+								if (
+									currentSection->chunkType[0] == 'I' &&
+									currentSection->chunkType[1] == 'N' &&
+									currentSection->chunkType[2] == 'F' &&
+									currentSection->chunkType[3] == '1'
+									)
+								{
+									struct INF1
+									{
+										char chunkType[4];
+										int32_t size;
+										int16_t miscFlags;
+										int16_t padding;
+										int32_t matrixGroupCount;
+										int32_t vertexCount;
+										int32_t hierarchyDataOffset;
+									};
 
-							// read the first 2 bytes of the chunk
-								const uint8_t b1 = *src++;
-								const uint8_t b2 = *src++;
+									const struct INF1* header = currentSection;
 
-								// calculate the source position
-								const uint8_t* copy_src = dest - ((b1 & 0x0f) << 8 | b2) - 1;
+									printf("size: %i\n", SwapEndian(header->size));
 
-								// calculate the number of bytes to copy.
-								int n = b1 >> 4;
+									printf("vertex count: %i\n", SwapEndian(header->vertexCount));
 
-								if (!n)
-									n = *src++ + 0x12; // N==0 -> read third byte
+									printf("hierarchy data offset: %i\n", SwapEndian(header->hierarchyDataOffset));
+
+									struct hierarchyNode
+									{
+										short NodeType;
+										short Data;
+									};
+
+									const struct hierarchyNode* bmdHierarchy = OffsetPointer(bmdFile, SwapEndian(header->hierarchyDataOffset));
+
+									int hierarchyNodeDepth = 0;
+									for (int hierarchyNodeIndex = 0; bmdHierarchy[hierarchyNodeIndex].NodeType != 0x00; hierarchyNodeIndex++)
+									{
+										for (int i = 0; i < hierarchyNodeDepth; i++)
+											printf("\t");
+
+										switch (SwapEndian(bmdHierarchy[hierarchyNodeIndex].NodeType))
+										{
+										case 0x00:
+											break;
+										case 0x01:
+											printf("new node\n");;
+											hierarchyNodeDepth++;
+											break;
+										case 0x02:
+											printf("end of node\n");
+											hierarchyNodeDepth--;
+											break;
+										case 0x10:
+											printf("joint (0x%X)\n", SwapEndian(SwapEndian(bmdHierarchy[hierarchyNodeIndex].Data)));
+											break;
+										case 0x11:
+											printf("material (0x%X)\n", SwapEndian(SwapEndian(bmdHierarchy[hierarchyNodeIndex].Data)));
+											break;
+										case 0x12:
+											printf("shape (0x%X)\n", SwapEndian(SwapEndian(bmdHierarchy[hierarchyNodeIndex].Data)));
+											break;
+										default:
+											DebugBreak();
+											break;
+										}
+									}
+
+									printf("end of hierarchy\n");
+								}
+								else if (
+									currentSection->chunkType[0] == 'V' &&
+									currentSection->chunkType[1] == 'T' &&
+									currentSection->chunkType[2] == 'X' &&
+									currentSection->chunkType[3] == '1')
+								{
+									printf("reading VTX1\n");
+								}
+								else if (
+									currentSection->chunkType[0] == 'E' &&
+									currentSection->chunkType[1] == 'V' &&
+									currentSection->chunkType[2] == 'P' &&
+									currentSection->chunkType[3] == '1')
+								{
+									printf("reading EVP1\n");
+								}
+								else if (
+									currentSection->chunkType[0] == 'D' &&
+									currentSection->chunkType[1] == 'R' &&
+									currentSection->chunkType[2] == 'W' &&
+									currentSection->chunkType[3] == '1')
+								{
+									printf("reading DRW1\n");
+								}
+								else if (
+									currentSection->chunkType[0] == 'J' &&
+									currentSection->chunkType[1] == 'N' &&
+									currentSection->chunkType[2] == 'T' &&
+									currentSection->chunkType[3] == '1')
+								{
+									printf("reading JNT1\n");
+								}
+								else if (
+									currentSection->chunkType[0] == 'S' &&
+									currentSection->chunkType[1] == 'H' &&
+									currentSection->chunkType[2] == 'P' &&
+									currentSection->chunkType[3] == '1')
+								{
+									printf("reading SHP1\n");
+								}
+								else if (
+									currentSection->chunkType[0] == 'M' &&
+									currentSection->chunkType[1] == 'A' &&
+									currentSection->chunkType[2] == 'T' &&
+									currentSection->chunkType[3] == '3')
+								{
+									printf("reading MAT3\n");
+								}
+								else if (
+									currentSection->chunkType[0] == 'T' &&
+									currentSection->chunkType[1] == 'E' &&
+									currentSection->chunkType[2] == 'X' &&
+									currentSection->chunkType[3] == '1')
+								{
+									printf("reading TEX1\n");
+
+									struct TEX1
+									{
+										char chunkType[4];
+										int32_t size;
+										uint16_t textureCount;
+										uint16_t padding;
+										int32_t textureHeaderOffset;
+										int32_t stringTableOffset;
+									};
+
+
+									const struct TEX1* header = currentSection;
+
+
+									printf("texture count: %i\n", SwapEndian(header->textureCount));
+
+									struct BTI
+									{
+										int8_t format;
+										bool alphaEnabled;
+										int16_t width;
+										int16_t height;
+										int8_t wrapS;
+										int8_t wrapT;
+										bool palettesEnabled;
+										int8_t palletteFormat;
+										int16_t palletteCount;
+										int32_t palletteOffset;
+										bool mipsEnabled;
+										bool doEdgeLOD;
+										bool biasClamp;
+										int8_t maxAnisotropy;
+										int8_t GXMinFilter;
+										int8_t GXMaxFilter;
+										int8_t MinLOD;
+										int8_t MaxLOD;
+										int8_t mipCount;
+										int8_t unknown;
+										int16_t LODBias;
+										int32_t textureDataOffset;
+									};
+
+									const struct BTI* BTIHeaderTable = OffsetPointer(header, SwapEndian(header->textureHeaderOffset));
+
+									for (int texNum = 0; texNum < SwapEndian(header->textureCount); texNum++)
+									{
+										printf("texture format: 0x%X\n", + BTIHeaderTable[texNum].format);
+										printf("texture size: %i x %i\n", SwapEndian(BTIHeaderTable[texNum].width), SwapEndian(BTIHeaderTable[texNum].height));
+										printf("offset in file: 0x%X\n", SwapEndian(BTIHeaderTable[texNum].textureDataOffset));
+
+										struct decodedImage* imageHeader = decodedAssetFreeZone;
+										decodedAssetFreeZone = OffsetPointer(decodedAssetFreeZone, sizeof(struct decodedImage));
+
+										imageHeader->width = SwapEndian(BTIHeaderTable[texNum].width);
+										imageHeader->height = SwapEndian(BTIHeaderTable[texNum].height);
+										imageHeader->pixelCount = SwapEndian(BTIHeaderTable[texNum].width) * SwapEndian(BTIHeaderTable[texNum].height);
+
+										imageHeader->pixels = decodedAssetFreeZone;
+										decodedAssetFreeZone += imageHeader->pixelCount * 4;
+										decodeTexture(imageHeader->width, imageHeader->height, imageHeader->pixelCount, OffsetPointer(&BTIHeaderTable[texNum], SwapEndian(BTIHeaderTable[texNum].textureDataOffset)), imageHeader->pixels, BTIHeaderTable->format);
+
+
+										decodedAssetTable[decodedAssetCount].assetType = ASSET_TYPE_TEXTURE;
+										decodedAssetTable[decodedAssetCount].assetPtr = imageHeader;
+										decodedAssetCount++;
+									}
+								}
 								else
-									n += 2; // add 2 to length
-								assert(n >= 3 && n <= 0x111);
+								{
+									DebugBreak();
+								}
 
-								// a validity check
-								// todo: figure out what this was for
-								if (/*copy_src < szs->data || */dest + n > dest_end)
-									printf("critical error!\n");
 
-								// copy chunk data.
-									// don't use memcpy() or memmove() here because
-									// they don't work with self referencing chunks.
-								while (n-- > 0)
-									*dest++ = *copy_src++;
+								currentSection = OffsetPointer(currentSection, SwapEndian(currentSection->size));
 							}
-
-							// shift group header byte
-							group_head <<= 1;
 						}
-
-						// some assertions to find errors in debugging mode
-						assert(src <= src_end);
-						assert(dest <= dest_end);
-
-						//todo: this is printing out shit that doesn't make sense for an uncompressed szs
-						for (int j = 0; j < 32; j++)
-						{
-							printf("%c", dest[j]);
-						}
-						printf("\n");
-
 					}
 					else if (wcscmp(extensionType, L".txt") == 0)
 					{
 						displayedFileType = 1;
+
+						//new ver
+						decodedAssetCount = 1;
+						decodedAssetTable[0].assetType = ASSET_TYPE_TEXT;
+						decodedAssetTable[0].assetPtr = gameFileList[selectedFileIndex].filePtr;
+
 					}
 					else if (wcscmp(extensionType, L".ini") == 0)
 					{
 						displayedFileType = 2;
+
+						//new ver
+						decodedAssetCount = 1;
+						decodedAssetTable[0].assetType = ASSET_TYPE_TEXT;
+						decodedAssetTable[0].assetPtr = gameFileList[selectedFileIndex].filePtr;
 					}
 					else
 					{
@@ -501,7 +1208,9 @@ int main()
 
 	//todo: temporary!
 	gameFileList = malloc(1024 * 1024 * 24);
-
+	decodedAssetTable = malloc(sizeof(struct decodedAsset) * 32);//maximum 32 assets per file?
+	//todo: use dynamically allocated array instead
+	decodedAssetData = malloc(1024 * 1024 * 24);
 	OPENFILENAME ofn = { 0 };
 	WCHAR szFile[260] = { 0 };
 
